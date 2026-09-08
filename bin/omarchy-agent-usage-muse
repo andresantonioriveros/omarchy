@@ -2,9 +2,9 @@
 # omarchy:summary=Print the Muse (Meta) usage record as JSON
 # omarchy:args=[--force] [--limits-only]
 # omarchy:hidden=true
-"""Collect Muse (Meta Muse Spark) local usage into one display-ready JSON record.
+"""Collect Muse (Meta Muse Spark) local usage plus subscription windows.
 
-Pure metering, no cost estimation and no network: token counts, prompt and
+Local metering (always available, no network): token counts, prompt and
 session counts, per-day and per-model breakdowns. Sources (all local):
   - native `muse` CLI sessions in $XDG_DATA_HOME/muse/sessions, defaulting to
     ~/.local/share/muse/sessions (`model_completed` events carry usage),
@@ -12,12 +12,17 @@ session counts, per-day and per-model breakdowns. Sources (all local):
   - opencode sessions with providerID == "opencode" whose modelID contains
     "muse-spark" (e.g. muse-spark-1.3-contributor-free via the opencode proxy).
 
-There is deliberately no limits section. Meta's Model API does publish
-per-minute throttle headers, but those buckets are per API key and the rate
-limits users actually hit are enforced elsewhere — plan windows and
-hosted-proxy (opencode console) throttling, neither of which is observable
-from here. A meter that reads 0% during real 429s misleads, so the collector
-omits limits instead of showing them. The agents panel only ever reads the
+Subscription windows (additive, authoritative only): when the CLI is signed
+in via `muse login`, the collector probes the client's own key endpoint
+(`POST https://api.meta.ai/muse-code/key` with the OAuth token from
+`MUSE_AUTH_PATH`, else `~/.config/muse/auth.json`) for `subs_usage`
+session (5-hour) + weekly percents with reset times plus `subs_tier_name` —
+the same figures the TUI's `/usage` overlay shows. Minting is idempotent so
+polling is safe; the token travels only in the Authorization header and
+neither it nor the returned API key is persisted. Pay-as-you-go accounts
+have no subscription windows, so limits stay empty and local metering still
+shows. No estimated meters from manual caps: without an authoritative probe
+the panel shows measured usage only. The agents panel only ever reads the
 JSON this prints.
 """
 
@@ -31,6 +36,8 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -51,6 +58,16 @@ CACHE_SCHEMA_VERSION = 1
 # concurrent collector runs; --limits-only may reuse a scan for 15 minutes.
 SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
+
+# Subscription probe reuse: polling mints the same key (idempotent) but the
+# answer moves slowly, so repeated panel opens reuse a recent probe.
+PROBE_MIN_INTERVAL_SECONDS = 60
+
+
+def key_endpoint() -> str:
+  # Overridable for tests, which point it at a local stub instead of Meta's
+  # key service.
+  return os.environ.get("MUSE_KEY_ENDPOINT") or "https://api.meta.ai/muse-code/key"
 
 
 def number(value):
@@ -368,6 +385,230 @@ def scan_opencode_sessions():
   return True
 
 
+# ------------------------------------------------------------------ limits
+#
+# Additive subscription windows only. Local metering above always runs; this
+# section only fills `limits`/`tierLabel`/status when the authoritative key
+# probe answers. Pay-as-you-go has no subscription windows: no token or a
+# probe with no subs_usage means limits stay empty (never estimated, never
+# zeroed) and local metering still shows. The OAuth token goes nowhere but
+# the Authorization header; only plan label + usage figures enter the record.
+
+
+def muse_config_dir() -> Path:
+  base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+  return Path(base) / "muse"
+
+
+def read_access_token() -> str:
+  try:
+    raw = (os.environ.get("MUSE_AUTH_PATH") or "").strip()
+    path = Path(os.path.expandvars(os.path.expanduser(raw))) if raw else (muse_config_dir() / "auth.json")
+    data = json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return ""
+  # Every level checked: a login file that parses to a list, or whose
+  # `providers` is not an object, is a missing credential, not a crash.
+  if not isinstance(data, dict):
+    return ""
+  providers = data.get("providers")
+  if not isinstance(providers, dict):
+    return ""
+  login = providers.get("meta")
+  if not isinstance(login, dict):
+    return ""
+  return str(login.get("access_token") or "")
+
+
+def normalize_reset_at(value) -> str:
+  if value is None:
+    return ""
+  try:
+    ts = float(value)
+  except Exception:
+    return ""
+  if ts <= 0:
+    return ""
+  # Epoch seconds; accept milliseconds too.
+  if ts >= 1e12:
+    ts = ts / 1000
+  try:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+  except Exception:
+    return ""
+
+
+def probe_key(access_token: str) -> dict:
+  request = urllib.request.Request(
+    key_endpoint(),
+    data=json.dumps({}).encode(),
+    method="POST",
+    headers={
+      "Authorization": "Bearer " + access_token,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+    },
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+      raw_body = response.read().decode("utf-8", errors="replace")
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      return {"ok": False, "expired": True,
+              "helpText": "Muse's saved sign-in was rejected. Run `muse login` to refresh it."}
+    return {"ok": False,
+            "helpText": f"Muse's usage endpoint returned status {error.code}. Local Muse stats are still shown."}
+  except Exception:
+    return {"ok": False, "transport": True,
+            "helpText": "Couldn't reach Muse's usage endpoint. Retrying shortly. Local Muse stats are still shown."}
+
+  try:
+    payload = json.loads(raw_body)
+  except Exception:
+    # The server answered but not with JSON: a shape change, not a network
+    # failure. No retryAdvised — re-asking won't fix the parser.
+    return {"ok": False, "helpText": "Muse's usage endpoint returned an unreadable response. Local Muse stats are still shown."}
+
+  usage = payload.get("subs_usage") if isinstance(payload, dict) else None
+  if not isinstance(usage, dict):
+    # PAYG account: key mints fine but there is no subscription window to
+    # meter (live shape: is_subs_active=false, subs_tier_name=null, no
+    # subs_usage). Local metering is the whole story — stay silent, not an
+    # error.
+    if isinstance(payload, dict) and payload.get("is_subs_active") is False:
+      return {"ok": False, "payg": True}
+    tier_hint = str(payload.get("subs_tier_name") or "") if isinstance(payload, dict) else ""
+    return {"ok": False, "tierLabel": tier_hint,
+            "helpText": "Muse's usage endpoint returned no usage. Local Muse stats are still shown."}
+
+  limits = []
+  window = usage.get("window") or {}
+  if isinstance(window, dict) and window.get("used_percent") is not None:
+    try:
+      percent = min(1.0, max(0.0, float(window.get("used_percent")) / 100.0))
+    except Exception:
+      percent = -1.0
+    if percent >= 0:
+      mins = number(window.get("window_duration_mins"))
+      label = "Session (5-hour)" if mins == 300 else (f"Session ({mins}m)" if mins > 0 else "Session")
+      limits.append({"label": label, "percent": percent, "resetsAt": normalize_reset_at(window.get("resets_at"))})
+  weekly = usage.get("weekly") or {}
+  if isinstance(weekly, dict) and weekly.get("used_percent") is not None:
+    try:
+      percent = min(1.0, max(0.0, float(weekly.get("used_percent")) / 100.0))
+    except Exception:
+      percent = -1.0
+    if percent >= 0:
+      limits.append({"label": "Weekly (7-day)", "percent": percent, "resetsAt": normalize_reset_at(weekly.get("resets_at"))})
+
+  if not limits:
+    tier_hint = str(payload.get("subs_tier_name") or "") if isinstance(payload, dict) else ""
+    return {"ok": False, "tierLabel": tier_hint,
+            "helpText": "Muse's usage endpoint returned no limits. Local Muse stats are still shown."}
+  tier = ""
+  if isinstance(payload, dict):
+    tier = str(payload.get("subs_tier_name") or "")
+  return {"ok": True, "limits": limits, "tierLabel": tier}
+
+
+def limit_window_open(entry: dict, now: datetime) -> bool:
+  # A cached percentage lives only until its window rolls over; past-reset
+  # figures describe a period that is over. No (or unreadable) reset is kept.
+  raw = str(entry.get("resetsAt") or "")
+  if raw == "":
+    return True
+  try:
+    resets_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+  except Exception:
+    return True
+  if resets_at.tzinfo is None:
+    resets_at = resets_at.replace(tzinfo=timezone.utc)
+  return resets_at > now
+
+
+def usable_cached_limits(cached: dict) -> list:
+  entries = cached.get("limits")
+  if not isinstance(entries, list):
+    return []
+  now = datetime.now(timezone.utc)
+  return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
+
+
+def collect_limits(force: bool) -> dict:
+  result = {"limits": [], "tierLabel": "Account", "usageStatusText": "", "authHelpText": ""}
+
+  probe_cache = None
+  try:
+    probe_cache = cache_root() / "muse-limits.json"
+    cached = json.loads(probe_cache.read_text(encoding="utf-8")) if probe_cache.exists() else {}
+  except Exception as exc:
+    print(f"omarchy-agent-usage-muse: could not read limits cache ({exc})", file=sys.stderr)
+    cached = {}
+  if not isinstance(cached, dict):
+    cached = {}
+  fallback = usable_cached_limits(cached)
+  fallback_tier = str(cached.get("tierLabel") or "")
+
+  access_token = read_access_token()
+  if access_token == "":
+    # No login: PAYG or signed-out. Never estimated, never an auth nag —
+    # local metering is valid on its own. Reuse unexpired cached windows if
+    # a previous subscription probe left any.
+    if fallback:
+      result["limits"] = fallback
+    if fallback_tier:
+      result["tierLabel"] = fallback_tier
+    return result
+
+  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  if (fallback or fallback_tier) and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+    result["limits"] = fallback
+    if fallback_tier:
+      result["tierLabel"] = fallback_tier
+    return result
+
+  probe = probe_key(access_token)
+  if probe["ok"]:
+    result["limits"] = probe["limits"]
+    if probe.get("tierLabel"):
+      result["tierLabel"] = probe["tierLabel"]
+    elif fallback_tier:
+      result["tierLabel"] = fallback_tier
+    if probe_cache is not None:
+      try:
+        write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000),
+                                 "limits": probe["limits"], "tierLabel": result["tierLabel"]})
+      except Exception as exc:
+        print(f"omarchy-agent-usage-muse: could not write limits cache ({exc})", file=sys.stderr)
+    return result
+
+  if probe.get("transport"):
+    result["retryAdvised"] = True
+  if probe.get("payg"):
+    # Authenticated PAYG: no subscription windows exist. Keep local metering
+    # only, silent — not an error, not expired.
+    return result
+  if probe.get("expired"):
+    result["usageStatusText"] = "Sign-in expired"
+    result["authHelpText"] = probe["helpText"]
+    result["limits"] = fallback
+    if fallback_tier:
+      result["tierLabel"] = fallback_tier
+    return result
+  if fallback:
+    result["limits"] = fallback
+    if fallback_tier:
+      result["tierLabel"] = fallback_tier
+    elif probe.get("tierLabel"):
+      result["tierLabel"] = probe["tierLabel"]
+  else:
+    result["usageStatusText"] = "Muse limits unavailable"
+    result["authHelpText"] = probe["helpText"]
+    if probe.get("tierLabel"):
+      result["tierLabel"] = probe["tierLabel"]
+  return result
+
+
 def cache_root():
   root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
   root.mkdir(parents=True, exist_ok=True)
@@ -488,13 +729,14 @@ def main():
 
   max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
   stats = cached_local_stats(max_age)
+  limits = collect_limits(args.force)
 
   record = {
     "schemaVersion": 1,
     "id": AGENT_ID,
     "name": AGENT_NAME,
     "updatedAt": datetime.now(timezone.utc).isoformat(),
-    "ready": number(stats.get("totalPrompts")) > 0,
+    "ready": number(stats.get("totalPrompts")) > 0 or len(limits["limits"]) > 0,
     "hasLocalStats": True,
     # Prompts and sessions are counted, so the panel shows them in tooltips.
     "hasPromptStats": True,
@@ -508,16 +750,13 @@ def main():
     "activeDays": number(stats.get("activeDays")),
     "activeDates": stats.get("activeDates") or [],
     "modelUsage": stats.get("modelUsage") or {},
-    # Muse does not expose whether this account is prepaid or subscription.
-    "tierLabel": "Account",
-    # No limits section, deliberately (see the module docstring): the panel
-    # only ever shows measured local usage for Muse.
-    "limits": [],
-    # Local metering needs no credentials and probes nothing, so there is
-    # never an auth state to report: both status fields stay empty.
-    "usageStatusText": "",
-    "authHelpText": "",
+    "tierLabel": limits["tierLabel"],
+    "limits": limits["limits"],
+    "usageStatusText": limits["usageStatusText"],
+    "authHelpText": limits["authHelpText"],
   }
+  if limits.get("retryAdvised"):
+    record["retryAdvised"] = True
   print(json.dumps(record, separators=(",", ":"), sort_keys=True))
   return 0
 
