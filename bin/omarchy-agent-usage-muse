@@ -52,7 +52,7 @@ MAX_SESSION_BYTES = 512 * 1024 * 1024
 
 # Cache schema version. Bump when the cached stats shape changes so old
 # caches are rescanned instead of trusted.
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 # Same cache semantics as the codex collector: a scan this recent only dedups
 # concurrent collector runs; --limits-only may reuse a scan for 15 minutes.
@@ -183,7 +183,7 @@ def muse_sessions_root():
 
 
 def iter_native_events(path):
-  """Yield (event_dict, recorded_at) pairs from a native session.jsonl file.
+  """Yield (event_dict, recorded_at, event_id) tuples from a native session.jsonl file.
 
   Handles both plain event lines and retained_frame wrappers whose children
   carry record_json payloads.
@@ -219,7 +219,7 @@ def iter_native_events(path):
           payload = event.get("payload") or {}
           if not isinstance(payload, dict):
             continue
-          yield payload, event.get("recorded_at")
+          yield payload, event.get("recorded_at"), event.get("id")
   except OSError:
     return
 
@@ -238,9 +238,14 @@ def scan_native_muse_sessions():
     return
   files = []
   try:
-    files = [p for p in root.rglob("session.jsonl") if p.is_file()]
+    # Session views contain copies of the same history. Check only paths
+    # below the sessions root, so a custom data parent is not excluded.
+    files = [p for p in root.rglob("session.jsonl")
+             if not any(part.startswith(".msp-view") for part in p.relative_to(root).parts[:-1])
+             and p.is_file()]
   except OSError:
     return
+  seen_event_ids = set()
   for path in files:
     try:
       # Fail closed on entries that could escape the sessions tree or stall
@@ -259,7 +264,7 @@ def scan_native_muse_sessions():
     except OSError:
       continue
     current_model = ""
-    for payload, recorded_at in iter_native_events(path):
+    for payload, recorded_at, event_id in iter_native_events(path):
       kind = payload.get("kind")
       if kind == "metadata":
         record = payload.get("record") or {}
@@ -299,6 +304,13 @@ def scan_native_muse_sessions():
       input_tokens = max(0, input_tokens - cache_read - cache_write)
       if not (input_tokens or output_tokens or cache_read or cache_write):
         continue
+      # Native record IDs survive copies and retained-frame wrapping. Claim
+      # only valid completions: metadata or malformed usage must not suppress
+      # a later usable record. Missing/malformed IDs cannot identify duplicates.
+      if isinstance(event_id, str) and event_id:
+        if event_id in seen_event_ids:
+          continue
+        seen_event_ids.add(event_id)
       day = local_day(recorded_at) if recorded_at else mtime_day
       # Subagent trees roll up into their parent session: normalize both the
       # main session.jsonl and any subagent/.../session.jsonl to the session
